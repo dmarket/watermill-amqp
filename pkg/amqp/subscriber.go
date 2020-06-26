@@ -2,6 +2,7 @@ package amqp
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
@@ -203,6 +204,14 @@ type subscription struct {
 	config  Config
 }
 
+// undelivered represents message that wasn't processed
+// due to error or subscription issues and must be Nack`ed.
+// Error represents only fail reason, not Nack indicator.
+type undelivered struct {
+	amqp.Delivery
+	error
+}
+
 func (s *subscription) ProcessMessages(ctx context.Context) {
 	amqpMsgs, err := s.createConsumer(s.queueName, s.channel)
 	if err != nil {
@@ -210,20 +219,43 @@ func (s *subscription) ProcessMessages(ctx context.Context) {
 		return
 	}
 
+	// unproc collects unprocessed deliveries
+	unproc := make(chan undelivered, cap(amqpMsgs)+1) // +1 for close attempt on full buffer
+	// errbreak breaks ConsumingLoop on unexpected error
+	errbreak := make(chan error, 1) // 1 for write attempt on exited ConsumingLoop
+	// done determines whether all listeners are done
+	done := make(chan struct{})
+
+	// any undelivered message will be Nack`ed
+	// regardless to its error value.
+	go func() {
+		for del := range unproc {
+			if del.error != nil {
+				s.logger.Error("Processing message failed, sending nack", del.error, s.logFields)
+			} else {
+				s.logger.Info("Message wasn't processed, sending nack", s.logFields)
+			}
+
+			if err := s.nackMsg(del.Delivery); err != nil {
+				s.logger.Error("Cannot nack message", err, s.logFields)
+
+				// something went really wrong when we cannot nack, let's reconnect
+				errbreak <- err
+				break
+			}
+		}
+		close(done)
+	}()
+
+	// wip waits till all processing messages aren't handled
+	var wip sync.WaitGroup
+
 ConsumingLoop:
 	for {
 		select {
 		case amqpMsg := <-amqpMsgs:
-			if err := s.processMessage(ctx, amqpMsg, s.out, s.logFields); err != nil {
-				s.logger.Error("Processing message failed, sending nack", err, s.logFields)
-
-				if err := s.nackMsg(amqpMsg); err != nil {
-					s.logger.Error("Cannot nack message", err, s.logFields)
-
-					// something went really wrong when we cannot nack, let's reconnect
-					break ConsumingLoop
-				}
-			}
+			wip.Add(1)
+			s.processMessage(ctx, amqpMsg, s.out, unproc, &wip, s.logFields)
 			continue ConsumingLoop
 
 		case <-s.notifyCloseChannel:
@@ -237,8 +269,17 @@ ConsumingLoop:
 		case <-ctx.Done():
 			s.logger.Info("Closing from ctx received", s.logFields)
 			break ConsumingLoop
+
+		case err := <-errbreak:
+			s.logger.Error("Something went wrong, stopping ProcessMessages", err, s.logFields)
+			break ConsumingLoop
 		}
 	}
+
+	wip.Wait()
+
+	close(unproc)
+	<-done
 }
 
 func (s *subscription) createConsumer(queueName string, channel *amqp.Channel) (<-chan amqp.Delivery, error) {
@@ -262,16 +303,22 @@ func (s *subscription) processMessage(
 	ctx context.Context,
 	amqpMsg amqp.Delivery,
 	out chan *message.Message,
+	unproc chan<- undelivered,
+	wg *sync.WaitGroup,
 	logFields watermill.LogFields,
-) error {
+) {
+	candef := true
+	defer doif(&candef, wg.Done)
+
 	msg, err := s.config.Marshaler.Unmarshal(amqpMsg)
 	if err != nil {
-		return err
+		unproc <- undelivered{Delivery: amqpMsg, error: err}
+		return
 	}
 
 	ctx, cancelCtx := context.WithCancel(ctx)
 	msg.SetContext(ctx)
-	defer cancelCtx()
+	defer doif(&candef, cancelCtx)
 
 	msgLogFields := logFields.Add(watermill.LogFields{"message_uuid": msg.UUID})
 	s.logger.Trace("Unmarshaled message", msgLogFields)
@@ -279,22 +326,52 @@ func (s *subscription) processMessage(
 	select {
 	case <-s.closing:
 		s.logger.Info("Message not consumed, pub/sub is closing", msgLogFields)
-		return s.nackMsg(amqpMsg)
+
+		unproc <- undelivered{Delivery: amqpMsg}
+		return
 	case out <- msg:
 		s.logger.Trace("Message sent to consumer", msgLogFields)
 	}
 
-	select {
-	case <-s.closing:
-		s.logger.Trace("Closing pub/sub, message discarded before ack", msgLogFields)
-		return s.nackMsg(amqpMsg)
-	case <-msg.Acked():
-		s.logger.Trace("Message Acked", msgLogFields)
-		return amqpMsg.Ack(false)
-	case <-msg.Nacked():
-		s.logger.Trace("Message Nacked", msgLogFields)
-		return s.nackMsg(amqpMsg)
+	// now all deferred funcs will be maintained by goroutine
+	candef = false
+
+	// async message Ack/Nack handling allows unblock
+	// receiving of rest messages and process them simultaneously.
+	go func() {
+		defer cancelCtx()
+		defer wg.Done()
+
+		var err error
+		select {
+		case <-s.closing:
+			s.logger.Trace("Closing pub/sub, message discarded before ack", msgLogFields)
+			err = s.nackMsg(amqpMsg)
+		case <-msg.Acked():
+			s.logger.Trace("Message Acked", msgLogFields)
+			err = amqpMsg.Ack(false)
+		case <-msg.Nacked():
+			s.logger.Trace("Message Nacked", msgLogFields)
+			err = s.nackMsg(amqpMsg)
+		}
+		if err != nil {
+			unproc <- undelivered{Delivery: amqpMsg, error: err}
+			return
+		}
+	}()
+}
+
+// doif is suitable for deferred execution func
+// that authorizes closure execution with
+// given cond.
+func doif(cond *bool, f func()) {
+	if cond == nil {
+		return
 	}
+	if !*cond {
+		return
+	}
+	f()
 }
 
 func (s *subscription) nackMsg(amqpMsg amqp.Delivery) error {
